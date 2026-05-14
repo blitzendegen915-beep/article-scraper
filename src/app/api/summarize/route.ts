@@ -1,102 +1,85 @@
 import { NextRequest, NextResponse } from 'next/server';
 import OpenAI from 'openai';
+import { createClient } from '@supabase/supabase-js';
+import { Ratelimit } from '@upstash/ratelimit';
+import { Redis } from '@upstash/redis';
+
+const ratelimit = new Ratelimit({
+  redis: Redis.fromEnv(),
+  limiter: Ratelimit.slidingWindow(5, '60 s'),
+});
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-function extractMetaContent(html: string, property: string): string {
-  const patterns = [
-    new RegExp(
-      `<meta[^>]+(?:property|name)=["']${property}["'][^>]+content=["']([^"']+)["']`,
-      'i'
-    ),
-    new RegExp(
-      `<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']${property}["']`,
-      'i'
-    ),
-  ];
-  for (const re of patterns) {
-    const m = html.match(re);
-    if (m) return m[1].trim();
-  }
-  return '';
-}
-
-function extractTitle(html: string): string {
-  const og = extractMetaContent(html, 'og:title');
-  if (og) return og;
-  const m = html.match(/<title[^>]*>([^<]+)<\/title>/i);
-  return m ? m[1].trim() : 'Untitled';
-}
-
-function extractText(html: string): string {
-  return html
-    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
 export async function POST(req: NextRequest) {
-  try {
-    const body = (await req.json()) as { url?: string };
-    const url = body.url;
-    if (!url) {
-      return NextResponse.json({ error: 'URLが必要です' }, { status: 400 });
-    }
+  const ip = req.headers.get('x-forwarded-for') ?? 'anonymous';
+  const { success } = await ratelimit.limit(ip);
 
-    // Server-side fetch - no CORS restriction
+  if (!success) {
+    return NextResponse.json(
+      { error: '1分間に送信できるのは5件までです。少し待ってからお試しください。' },
+      { status: 429 }
+    );
+  }
+
+  const { url } = await req.json();
+  if (!url || !/^https?:\/\//.test(url)) {
+    return NextResponse.json({ error: '有効なURLを入力してください' }, { status: 400 });
+  }
+
+  let title = '';
+  let bodyText = '';
+
+  try {
     const fetchRes = await fetch(url, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        Accept: 'text/html,application/xhtml+xml',
-      },
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; LinkNoteBot/1.0)' },
       signal: AbortSignal.timeout(12000),
     });
-
-    if (!fetchRes.ok) {
-      throw new Error(`ページの取得に失敗しました (HTTP ${fetchRes.status})`);
-    }
-
     const html = await fetchRes.text();
-    const title = extractTitle(html);
-    const content = extractText(html);
 
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [
-        {
-          role: 'user',
-          content: `以下の記事を3行で要約し、関連タグを3〜5個生成してください。
+    const ogTitle = html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i);
+    const titleTag = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+    title = ogTitle?.[1] ?? titleTag?.[1] ?? url;
 
-タイトル: ${title}
-内容: ${content.slice(0, 3000)}
-
-以下のJSON形式だけで返してください:
-{"summary":"要約1行目\n要約2行目\n要約3行目","tags":["tag1","tag2","tag3"]}`,
-        },
-      ],
-      response_format: { type: 'json_object' },
-      max_tokens: 500,
-    });
-
-    const result = JSON.parse(
-      completion.choices[0]?.message?.content ?? '{}'
-    ) as { summary?: string; tags?: string[] };
-
-    return NextResponse.json({
-      title,
-      summary: result.summary ?? '',
-      tags: result.tags ?? [],
-    });
-  } catch (e) {
-    const message = e instanceof Error ? e.message : '不明なエラー';
-    return NextResponse.json({ error: message }, { status: 500 });
+    bodyText = html
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 4000);
+  } catch {
+    return NextResponse.json({ error: '記事の取得に失敗しました' }, { status: 422 });
   }
+
+  const prompt = `以下の記事を読んで、JSON形式で返してください。
+{
+  "summary": ["1文目", "2文目", "3文目"],
+  "tags": ["タグ1", "タグ2", "タグ3"]
+}
+タイトル: ${title}
+本文: ${bodyText}`;
+
+  const completion = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    messages: [{ role: 'user', content: prompt }],
+    response_format: { type: 'json_object' },
+  });
+
+  const parsed = JSON.parse(completion.choices[0].message.content ?? '{}');
+
+  const supabase = createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  );
+
+  const { data, error } = await supabase
+    .from('articles')
+    .insert({ url, title, summary: parsed.summary?.join('\n'), tags: parsed.tags })
+    .select()
+    .single();
+
+  if (error) return NextResponse.json({ error: 'DB保存に失敗しました' }, { status: 500 });
+
+  return NextResponse.json(data);
 }
